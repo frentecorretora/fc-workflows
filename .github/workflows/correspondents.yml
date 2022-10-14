@@ -1,0 +1,191 @@
+name: correspondents pipeline
+
+on: workflow_call
+
+env:
+  ECR_REPO: correspondents
+  COMPOSE_REFERENCE_IMAGE: white_label:correspondents
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      -
+        name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@v3
+        with:
+          file: dev.Dockerfile
+          push: true
+          tags: ghcr.io/frentecorretora/${{ github.event.repository.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  lint:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      -
+        name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Run lint
+        run: |
+             docker pull ghcr.io/frentecorretora/${{ github.event.repository.name }}
+             docker tag ghcr.io/frentecorretora/${{ github.event.repository.name }} $COMPOSE_REFERENCE_IMAGE
+             docker-compose run --rm lint
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      -
+        name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Run test
+        run: |
+             docker pull ghcr.io/frentecorretora/redis:3.2.10-alpine
+             docker pull ghcr.io/frentecorretora/postgres:10.6
+             docker pull ghcr.io/frentecorretora/${{ github.event.repository.name }}
+             docker tag ghcr.io/frentecorretora/${{ github.event.repository.name }} $COMPOSE_REFERENCE_IMAGE
+             docker-compose run --rm specs npm install
+             docker-compose run --rm specs ./node_modules/.bin/sequelize db:create
+             docker-compose run --rm specs ./node_modules/.bin/sequelize db:migrate
+             docker-compose run -e ci=true --rm specs
+
+
+  
+  checkVersion:
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      id-token: write
+      contents: read
+    if: github.ref == 'refs/heads/homolog' || github.ref == 'refs/heads/prod'
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: "Extract version"
+        id: extractPackage
+        run: |
+             touch getVersion.env
+             PACKAGE_VERSION=$(jq -r .version package.json)
+             echo PACKAGE_VERSION is $PACKAGE_VERSION
+             echo PACKAGE_VERSION=$PACKAGE_VERSION >> getVersion.env
+             echo ::set-output name=package_version::$PACKAGE_VERSION
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      - 
+        name: Get branch name
+        id: branch-name
+        uses: tj-actions/branch-names@v5.5
+      -
+        name: Extract ECR versions and compare
+        run: |
+             echo "$IAM_ROLES" >> credentials
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             ENVIRONMENT=${{ steps.branch-name.outputs.current_branch }}
+             PACKAGE_VERSION=${{ steps.extractPackage.outputs.package_version }}
+             echo "Running on: $ENVIRONMENT - Package Version: $PACKAGE_VERSION"
+             aws ecr list-images --profile $ENVIRONMENT --repository-name $ECR_REPO >> imageList.json
+             cat imageList.json
+             if [ $(jq '[.imageIds[] | .imageTag] | contains(['\"${PACKAGE_VERSION}\"'])' imageList.json) = true ]; then echo "Version $PACKAGE_VERSION already exists" && exit 1; else echo "Version $PACKAGE_VERSION allowed"; fi;
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}
+
+  pushImage:
+    if: github.ref == 'refs/heads/test' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/homolog' || github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      - 
+        name: Get branch name
+        id: branch-name
+        uses: tj-actions/branch-names@v5.5
+      -
+        name: "Extract version"
+        id: extractPackage
+        run: |
+             touch getVersion.env
+             PACKAGE_VERSION=$(jq -r .version package.json)
+             echo PACKAGE_VERSION is $PACKAGE_VERSION
+             echo PACKAGE_VERSION=$PACKAGE_VERSION >> getVersion.env
+             echo ::set-output name=package_version::$PACKAGE_VERSION
+      -
+        name: Build and push to ECR
+        run: |
+             echo "$IAM_ROLES" >> credentials
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             ENVIRONMENT=${{ steps.branch-name.outputs.current_branch }}
+             AWS_ACCOUNT_ID=$(aws sts get-caller-identity --profile $ENVIRONMENT --query Account --output text)
+             PACKAGE_VERSION=${{ steps.extractPackage.outputs.package_version }}
+             
+             if [ "$ENVIRONMENT" = dev ] || [ "$ENVIRONMENT" = test ] ; then
+              aws ecr get-login-password --profile $ENVIRONMENT --region us-east-1 | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID".dkr.ecr.us-east-1.amazonaws.com
+              docker build -t $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:latest .
+              docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:latest
+              for OUTPUT in $(aws ecs list-tasks --profile $ENVIRONMENT --cluster simple --desired-status RUNNING --family ${ECR_REPO} --query taskArns | egrep "task/" | sed -r "s/.*task\/(.*)\"/\1/") ; do echo "stopping task" $(aws ecs stop-task --profile $ENVIRONMENT --cluster simple --task ${OUTPUT} --query task.taskArn | egrep "task/" | sed -r "s/.*task\/(.*)\"/\1/") ; done
+             fi  
+             if [ "$ENVIRONMENT" = homolog ]; then
+              aws ecr get-login-password --profile $ENVIRONMENT --region us-east-1 | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID".dkr.ecr.us-east-1.amazonaws.com
+              docker build -t $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:latest .
+              docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:latest
+              docker tag $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:latest $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:$PACKAGE_VERSION 
+              docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:$PACKAGE_VERSION
+              for OUTPUT in $(aws ecs list-tasks --profile $ENVIRONMENT --cluster simple --desired-status RUNNING --family ${ECR_REPO} --query taskArns | egrep "task/" | sed -r "s/.*task\/(.*)\"/\1/") ; do echo "stopping task" $(aws ecs stop-task --profile $ENVIRONMENT --cluster simple --task ${OUTPUT} --query task.taskArn | egrep "task/" | sed -r "s/.*task\/(.*)\"/\1/") ; done
+             fi
+             if [ "$ENVIRONMENT" = prod ]; then
+              aws ecr get-login-password --profile $ENVIRONMENT --region us-east-1 | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID".dkr.ecr.us-east-1.amazonaws.com
+              docker build -t $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:latest $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:$PACKAGE_VERSION .
+              docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:$PACKAGE_VERSION
+              AWS_ACCOUNT_ID=$(aws sts get-caller-identity --profile $demo --query Account --output text)
+              aws ecr get-login-password --profile $ENVIRONMENT --region us-east-1 | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID".dkr.ecr.us-east-1.amazonaws.com
+              docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$ECR_REPO:$PACKAGE_VERSION
+              curl --header "Content-Type:application/json" --request POST --data '{"text":"'${ECR_REPO}_${{ steps.branch-name.outputs.current_branch }}' pronto para deploy"}' $SLACK_WEBHOOK_URL
+             fi
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}
+          SLACK_WEBHOOK_URL: ${{secrets.SLACK_WEBHOOK_URL}}

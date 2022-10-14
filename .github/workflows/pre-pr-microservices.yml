@@ -1,0 +1,53 @@
+name: pre-pr microservices
+
+on: 
+  workflow_call:
+    inputs:
+      ECR_REPO:
+        required: true
+        type: string
+      TARGET_BRANCH:
+        required: true
+        type: string      
+
+jobs:
+  checkVersion:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: "Extract version"
+        id: extractPackage
+        run: |
+             touch getVersion.env
+             PACKAGE_VERSION=$(jq -r .version package.json)
+             echo PACKAGE_VERSION is $PACKAGE_VERSION
+             echo PACKAGE_VERSION=$PACKAGE_VERSION >> getVersion.env
+             echo ::set-output name=package_version::$PACKAGE_VERSION
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      - 
+        name: Get branch name
+        id: branch-name
+        uses: tj-actions/branch-names@v5.5
+      -
+        name: Extract ECR versions and compare
+        run: |
+             echo "$IAM_ROLES" >> credentials
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             PACKAGE_VERSION=${{ steps.extractPackage.outputs.package_version }}
+             echo "Running on: ${{ inputs.TARGET_BRANCH }} - Package Version: $PACKAGE_VERSION"
+             aws ecr list-images --profile ${{ inputs.TARGET_BRANCH }} --repository-name ${{ inputs.ECR_REPO }} >> imageList.json
+             cat imageList.json
+             if [ $(jq '[.imageIds[] | .imageTag] | contains(['\"${PACKAGE_VERSION}\"'])' imageList.json) = true ]; then echo "Version $PACKAGE_VERSION already exists" && exit 1; else echo "Version $PACKAGE_VERSION allowed"; fi;
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}

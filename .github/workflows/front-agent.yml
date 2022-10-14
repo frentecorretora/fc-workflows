@@ -1,0 +1,205 @@
+name: Site Agent
+
+on: workflow_call
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/frentecorretora/frontpipe:latest
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Run tests
+        run: |
+             yarn
+             yarn test
+
+  lint:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/frentecorretora/frontpipe:latest
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Run lint
+        run: |
+             yarn
+             yarn lint
+
+  push:
+    if: github.ref == 'refs/heads/test' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/homolog'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/frentecorretora/frontpipe:latest
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    needs: [lint, tests]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      - 
+        name: Get branch name
+        id: branch-name
+        uses: tj-actions/branch-names@v5.5
+      - 
+        name: Sets env vars for test
+        run: |
+          echo "SSMPREFIX=test" >> $GITHUB_ENV
+          echo "PRODUCTION=1" >> $GITHUB_ENV
+          echo "BUCKET=s3://frente-wl-admin-test" >> $GITHUB_ENV
+          echo "DISTRIBUTION_ID=E17C10AA29KBG6" >> $GITHUB_ENV
+        if: startsWith(github.ref, 'refs/heads/test')
+      - 
+        name: Sets env vars for dev
+        run: |
+          echo "SSMPREFIX=dev" >> $GITHUB_ENV
+          echo "PRODUCTION=1" >> $GITHUB_ENV
+          echo "BUCKET=s3://simple-site-admin-dev" >> $GITHUB_ENV
+          echo "DISTRIBUTION_ID=E23YWBKHYDK31D" >> $GITHUB_ENV
+        if: startsWith(github.ref, 'refs/heads/dev')
+      - 
+        name: Sets env vars for homolog
+        run: |
+          echo "SSMPREFIX=homolog" >> $GITHUB_ENV
+          echo "PRODUCTION=1" >> $GITHUB_ENV
+          echo "BUCKET=s3://simple-site-admin-homolog" >> $GITHUB_ENV
+          echo "DISTRIBUTION_ID=E3UKWH5D209KKZ" >> $GITHUB_ENV
+        if: startsWith(github.ref, 'refs/heads/homolog')
+      -
+        name: S3 push and Cloudfront invalidation
+        run: |
+             echo "$IAM_ROLES" >> credentials
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             yarn
+             chmod -R 777 /__w
+             for row in $(aws ssm get-parameters-by-path --profile ${{ steps.branch-name.outputs.current_branch }} --with-decryption --path /${SSMPREFIX} | jq -r '.Parameters[] | @base64'); do
+              NAME=$(echo ${row} | base64 -di | jq -rc .Name | cut -d'/' -f3)
+              VALUE=$(echo ${row} | base64 -di | jq -rc .Value)
+              if [ "$NAME" != "AWS_ACCESS_KEY_ID" ] && [ "$NAME" != "AWS_SECRET_ACCESS_KEY" ]; then
+                export "$NAME"="$VALUE"
+              fi
+             done
+             npx quasar build
+             ENVIRONMENT=${{ steps.branch-name.outputs.current_branch }}
+             aws s3 sync --profile ${{ steps.branch-name.outputs.current_branch }} ./dist/spa $BUCKET/agent --acl public-read 
+             aws cloudfront create-invalidation --profile ${{ steps.branch-name.outputs.current_branch }} --distribution-id $DISTRIBUTION_ID --paths "/*"
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}
+
+  push-production:
+    if: github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/frentecorretora/frontpipe:latest
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    needs: [lint, tests]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      -
+        name: S3 push and Cloudfront invalidation
+        run: |
+             echo "$IAM_ROLES" >> credentials
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             yarn
+             chmod -R 777 /__w
+             for row in $(aws ssm get-parameters-by-path --profile ${{ steps.branch-name.outputs.current_branch }} --with-decryption --path /${SSMPREFIX} | jq -r '.Parameters[] | @base64'); do
+              NAME=$(echo ${row} | base64 -di | jq -rc .Name | cut -d'/' -f3)
+              VALUE=$(echo ${row} | base64 -di | jq -rc .Value)
+              if [ "$NAME" != "AWS_ACCESS_KEY_ID" ] && [ "$NAME" != "AWS_SECRET_ACCESS_KEY" ]; then
+                export "$NAME"="$VALUE"
+              fi
+             done
+             npx quasar build
+             aws s3 sync --profile prod ./dist/spa $BUCKET/agent --acl public-read 
+             aws cloudfront create-invalidation --profile prod --distribution-id $DISTRIBUTION_ID --paths "/*"
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}
+          BUCKET: "s3://frente-wl-admin-production"
+          DISTRIBUTION_ID: "E17AGCCO025G0G"
+          SSMPREFIX: "production"
+
+  push-demo:
+    if: github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/frentecorretora/frontpipe:latest
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    needs: [lint, tests]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      -
+        name: S3 push and Cloudfront invalidation
+        run: |
+             echo "$IAM_ROLES" >> credentials
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             yarn
+             chmod -R 777 /__w
+             for row in $(aws ssm get-parameters-by-path --profile ${{ steps.branch-name.outputs.current_branch }} --with-decryption --path /${SSMPREFIX} | jq -r '.Parameters[] | @base64'); do
+              NAME=$(echo ${row} | base64 -di | jq -rc .Name | cut -d'/' -f3)
+              VALUE=$(echo ${row} | base64 -di | jq -rc .Value)
+              if [ "$NAME" != "AWS_ACCESS_KEY_ID" ] && [ "$NAME" != "AWS_SECRET_ACCESS_KEY" ]; then
+                export "$NAME"="$VALUE"
+              fi
+             done
+             npx quasar build
+             aws s3 sync --profile demo ./dist/spa $BUCKET/agent --acl public-read 
+             aws cloudfront create-invalidation --profile demo --distribution-id $DISTRIBUTION_ID --paths "/*"
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}
+          BUCKET: "s3://frente-wl-admin-production"
+          DISTRIBUTION_ID: "E17AGCCO025G0G"
+          SSMPREFIX: "demo"

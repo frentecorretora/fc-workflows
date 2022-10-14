@@ -1,0 +1,48 @@
+name: lambda-gateways pipeline
+
+on: workflow_call
+
+jobs:
+  deploy-non-production:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/frentecorretora/node:16
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    permissions:
+      id-token: write
+      contents: read
+    if: github.ref == 'refs/heads/non-production' || github.ref == 'refs/heads/production'
+    steps:
+      - 
+        name: "Checkout"
+        uses: actions/checkout@v3
+      -
+        name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::277048801940:role/GithubActions
+          aws-region: us-east-1
+      - 
+        name: Get environment
+        id: branch-name
+        uses: tj-actions/branch-names@v5.5
+      - 
+        name: Sets env vars for non-production
+        run: |
+          echo "DEV_PAYMENTS_QUEUE=https://sqs.us-east-1.amazonaws.com/911029263118/simple_payments_queue" >> $GITHUB_ENV
+          echo "HOMOLOG_PAYMENTS_QUEUE=https://sqs.us-east-1.amazonaws.com/973021393063/simple_payments_queue" >> $GITHUB_ENV
+          echo "DEMO_PAYMENTS_QUEUE=https://sqs.us-east-1.amazonaws.com/379845053270/simple_payments_queue" >> $GITHUB_ENV
+        if: startsWith(github.ref, 'refs/heads/non-production')
+      -
+        name: Serverless deploy
+        run: |
+             echo "$IAM_ROLES" >> credentials         
+             export AWS_SHARED_CREDENTIALS_FILE="$PWD/credentials"
+             ENVIRONMENT=${{ steps.branch-name.outputs.current_branch }}
+             echo "Running on: $ENVIRONMENT"
+             yarn install
+             yarn run deploy:$ENVIRONMENT 
+        env:
+          IAM_ROLES: ${{secrets.IAM_ROLES}}
